@@ -1,0 +1,9 @@
+{
+  "name": "sun-holdings-live-portal",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/blob": "latest",
+    "jose": "latest"
+  }
+}

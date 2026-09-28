@@ -1,0 +1,136 @@
+// SUN Holdings Live Portal — data API (Vercel serverless function).
+// Every request must carry a Microsoft Entra ID token for this app. People on PORTAL_VIEWERS can read;
+// people on PORTAL_ADMINS (Seamless FM) can also write. The portal's data is one JSON state kept as
+// numbered versions in a private Vercel Blob store; the newest KEEP_VERSIONS are kept as a rolling backup.
+import { list, put, del } from '@vercel/blob';
+import { createRemoteJWKSet, decodeJwt, jwtVerify } from 'jose';
+
+const CLIENT_ID = (process.env.ENTRA_CLIENT_ID || '').trim();
+const TENANTS = splitList(process.env.ENTRA_TENANT_IDS);          // tenants whose accounts may sign in
+const ADMINS = splitList(process.env.PORTAL_ADMINS);             // emails or @domains that can edit
+const VIEWERS = splitList(process.env.PORTAL_VIEWERS);           // emails or @domains that can read
+const PREFIX = 'portal-state-';
+const KEEP_VERSIONS = 30;
+const MAX_DOC_BYTES = 256 * 1024;
+const MAX_DOCS = 5000;
+const SEGMENT = /^[A-Za-z0-9_\-.~:@+]{1,200}$/;
+
+// Entra signs tokens for every tenant with the same key set
+const JWKS = createRemoteJWKSet(new URL('https://login.microsoftonline.com/common/discovery/v2.0/keys'));
+
+function splitList(s) {
+  return String(s || '').split(/[,;\s]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+}
+const onList = (email, listed) => !!email && listed.some(e => (e.startsWith('@') ? email.endsWith(e) : email === e));
+
+async function identify(req) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+  if (!token || !CLIENT_ID || !TENANTS.length) return null;
+  let tid = '';
+  try { tid = String(decodeJwt(token).tid || '').toLowerCase(); } catch (e) { return null; }
+  if (!TENANTS.includes(tid)) return null;
+  try {
+    const { payload } = await jwtVerify(token, JWKS, { issuer: `https://login.microsoftonline.com/${tid}/v2.0`, audience: CLIENT_ID });
+    const email = String(payload.email || payload.preferred_username || payload.upn || '').toLowerCase();
+    return { id: email || String(payload.oid || ''), email, name: String(payload.name || email || 'Someone') };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function readBlobJson(blob) {
+  let res = await fetch(blob.url, { headers: { authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}` } });
+  if (!res.ok) res = await fetch(blob.downloadUrl || blob.url);
+  if (!res.ok) throw new Error('blob-read-' + res.status);
+  return res.json();
+}
+
+async function versions() {
+  const { blobs } = await list({ prefix: PREFIX });
+  return blobs.sort((a, b) => b.pathname.localeCompare(a.pathname));
+}
+
+async function latest() {
+  const blobs = await versions();
+  if (!blobs.length) return { version: 0, docs: {}, people: {} };
+  const s = await readBlobJson(blobs[0]);
+  return { version: Number(s.version) || 0, docs: s.docs || {}, people: s.people || {}, updatedAt: s.updatedAt, updatedBy: s.updatedBy };
+}
+
+async function save(state) {
+  const name = `${PREFIX}${String(state.version).padStart(10, '0')}.json`;
+  await put(name, JSON.stringify(state), { access: 'private', contentType: 'application/json', addRandomSuffix: true });
+  try {
+    const stale = (await versions()).slice(KEEP_VERSIONS).map(b => b.url);
+    if (stale.length) await del(stale);
+  } catch (e) { /* pruning is best-effort */ }
+}
+
+// document paths: collection/doc pairs, e.g. "portal/meta", "chunks/c0", "updates/abc123"
+function validPath(p) {
+  if (typeof p !== 'string' || p.length > 1000) return false;
+  const parts = p.split('/');
+  return parts.length >= 2 && parts.length <= 16 && parts.length % 2 === 0 && parts.every(s => SEGMENT.test(s) && s !== '.' && s !== '..');
+}
+
+// nested objects merge; arrays and everything else replace (same as the page expects)
+function merge(target, patch) {
+  const out = Array.isArray(target) || typeof target !== 'object' || target === null ? {} : { ...target };
+  for (const [k, v] of Object.entries(patch)) {
+    out[k] = v && typeof v === 'object' && !Array.isArray(v) && out[k] && typeof out[k] === 'object' && !Array.isArray(out[k]) ? merge(out[k], v) : v;
+  }
+  return out;
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  const who = await identify(req);
+  if (!who) return res.status(401).json({ error: 'unauthorized' });
+  const canEdit = onList(who.email, ADMINS);
+  const canView = canEdit || onList(who.email, VIEWERS);
+  const me = { id: who.id, name: who.name, email: who.email, canEdit };
+  if (!canView) return res.status(403).json({ error: 'forbidden', me });
+
+  try {
+    if (req.method === 'GET') {
+      const state = await latest();
+      const since = Number(req.query && req.query.since);
+      if (Number.isFinite(since) && since === state.version) return res.status(200).json({ unchanged: true, version: state.version, me });
+      // names of the Seamless FM people who changed things are for the admin view only
+      return res.status(200).json({ version: state.version, docs: state.docs, people: canEdit ? state.people : {}, me });
+    }
+
+    if (req.method === 'POST') {
+      if (!canEdit) return res.status(403).json({ error: 'read-only', me });
+      const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+      const { op, path, data } = body;
+      if (!['set', 'update', 'delete'].includes(op)) return res.status(400).json({ error: 'bad-op' });
+      if (!validPath(path)) return res.status(400).json({ error: 'bad-path' });
+      if (op !== 'delete' && (!data || typeof data !== 'object' || Array.isArray(data))) return res.status(400).json({ error: 'bad-data' });
+
+      const state = await latest();
+      if (op === 'set') state.docs[path] = data;
+      else if (op === 'update') {
+        if (!Object.prototype.hasOwnProperty.call(state.docs, path)) return res.status(400).json({ error: 'not-found' });
+        state.docs[path] = merge(state.docs[path], data);
+      } else delete state.docs[path];
+
+      if (op !== 'delete' && Buffer.byteLength(JSON.stringify(state.docs[path])) > MAX_DOC_BYTES) return res.status(413).json({ error: 'document-too-large' });
+      if (Object.keys(state.docs).length > MAX_DOCS) return res.status(413).json({ error: 'too-many-documents' });
+
+      state.people[who.id] = who.name;
+      state.version += 1;
+      state.updatedAt = Date.now();
+      state.updatedBy = who.id;
+      await save(state);
+      return res.status(200).json({ version: state.version, docs: state.docs, people: state.people, me });
+    }
+
+    res.setHeader('Allow', 'GET, POST');
+    return res.status(405).json({ error: 'method-not-allowed' });
+  } catch (e) {
+    console.error('portal api', e);
+    return res.status(500).json({ error: 'server' });
+  }
+}

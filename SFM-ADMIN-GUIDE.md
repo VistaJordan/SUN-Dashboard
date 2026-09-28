@@ -4,11 +4,13 @@ The portal is what Sun Holdings sees, live, at any time. Anything you save shows
 
 ## Signing in
 
-- Open the portal address and choose **Sign in with Microsoft** with your Seamless FM work account.
-- The top bar shows your name, a green **Live** light, and a switch between two views:
+- Open the portal address. It opens read-only, as the client sees it, with a green **Live** light.
+- Click **Seamless FM sign-in** in the top bar and enter your name and the Seamless FM admin code (ask Jordan for it). You only do this once per browser.
+- The top bar then shows your name and a switch between two views:
   - **SFM admin** is your editing view.
   - **Client view** shows exactly what Sun Holdings sees.
-- To sign out, click your name in the top bar twice.
+- To sign out of editing, click your name in the top bar twice.
+- Sun Holdings needs no sign-in: send them the link (and the viewer code, if one has been set up).
 
 ## Every week
 
@@ -60,5 +62,6 @@ The portal is what Sun Holdings sees, live, at any time. Anything you save shows
   | In progress | Job Scheduled, Needs Proposal, Quote Ready, On Site, Today, Recall, RTN, Approved - Not scheduled |
   | Open | Everything else |
 
-- If the top bar says **Reconnect**, click it and sign in again; Microsoft sessions expire after about a day.
+- If the top bar says **Offline**, the page lost its connection; it retries every 15 seconds on its own.
+- If a save says editing is locked, click **Seamless FM sign-in** and enter the admin code again (it changes when the code is changed in Vercel).
 - To remove all live data, use **Manage → Activity → Remove live data**. It asks you to confirm.

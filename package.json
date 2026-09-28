@@ -3,7 +3,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@vercel/blob": "latest",
-    "jose": "latest"
+    "@vercel/blob": "latest"
   }
 }

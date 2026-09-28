@@ -5,14 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
 <style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}img{max-width:100%}[hidden]{display:none!important}</style>
-<script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
 <script>
-/* ================= DEPLOYMENT SETTINGS: the only lines IT edits (see README-DEPLOY.md) ================= */
-window.PORTAL_HOSTED = {
-  clientId: 'PASTE-APPLICATION-CLIENT-ID-HERE',   // Entra app registration -> Application (client) ID
-  tenantId: 'PASTE-DIRECTORY-TENANT-ID-HERE',     // Seamless FM Directory (tenant) ID, or 'organizations' for multi-tenant sign-in
-  api: '/api/portal'
-};
+/* ================= DEPLOYMENT SETTINGS (see README-DEPLOY.md) =================
+   Microsoft sign-in is switched off for now. Anyone with the link can view; Seamless FM staff unlock editing
+   with the admin code set as PORTAL_ADMIN_KEY in Vercel (if PORTAL_VIEW_KEY is set, viewers enter that code once). */
+window.PORTAL_HOSTED = { api: '/api/portal' };
 </script>
 <title>SUN Holdings Live Portal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -397,6 +394,10 @@ body.admin .clientonly { display: none !important; }
 .gate-box p b { color: var(--text); }
 .gate-box code { font-family: var(--f-mono); font-size: 12px; background: var(--card-2); border: 1px solid var(--line); padding: 1px 5px; border-radius: var(--r); overflow-wrap: anywhere; }
 .gate-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.gate-form { flex: 1 0 100%; display: grid; gap: 10px; margin: 4px 0 6px; }
+.gate-form label { display: grid; gap: 5px; font-family: var(--f-mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-2); }
+.gate-form input { height: 40px; border: 1px solid var(--line-2); background: var(--card-2); color: var(--text); border-radius: var(--r); padding: 0 12px; font: inherit; font-size: 16px; }
+.gate-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 button.live { cursor: pointer; }
 footer { border-top: 1px solid var(--line); padding: 26px 40px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); }
 footer .fb { font-family: var(--f-disp); font-weight: 800; font-size: 16px; letter-spacing: .08em; text-transform: uppercase; color: var(--text); }
@@ -458,7 +459,7 @@ footer .mono { font-size: 11px; letter-spacing: .06em; }
     <div class="nav-right">
       <span class="live" id="live" title="Connection"><i></i><span id="liveTxt">Connecting</span></span>
       <div class="modes" id="modes" hidden><button type="button" data-mode="admin" class="on">SFM admin</button><button type="button" data-mode="client">Client view</button></div>
-      <button type="button" class="mini" id="userChip" hidden title="Sign out"></button>
+      <button type="button" class="mini" id="userChip" hidden title="Seamless FM sign-in"></button>
       <button type="button" class="ibtn" id="themeBtn" aria-label="Switch light or dark theme" title="Switch theme"></button>
     </div>
   </nav>
@@ -1246,7 +1247,7 @@ async function write(fn, okMsg) {
   try { await fn(); if (okMsg) toast(okMsg); return true; }
   catch (err) {
     const c = err && err.code;
-    toast(c === 'invalid_argument' ? 'You don’t have permission to change the live portal. Ask the owner for Editor access.' : c === 'quota_exceeded' ? 'The portal’s storage is full. Remove old updates and try again.' : 'That change didn’t save. Check your connection and try again.', true);
+    toast(c === 'read-only' ? 'Editing is locked. Click “Seamless FM sign-in” in the top bar and enter the admin code.' : c === 'invalid_argument' ? 'You don’t have permission to change the live portal. Ask the owner for Editor access.' : c === 'quota_exceeded' ? 'The portal’s storage is full. Remove old updates and try again.' : 'That change didn’t save. Check your connection and try again.', true);
     return false;
   }
 }
@@ -1419,26 +1420,27 @@ function localDB() {
   return { doc: docRef, collection: colRef };
 }
 
-/* ============ self-hosted deployment: Microsoft sign-in + /api/portal (see README-DEPLOY.md) ============ */
-// Same document interface the page uses on claude.ai, backed by the portal API. Changes reach every open page within POLL_MS.
+/* ============ self-hosted deployment: shared link + admin code, backed by /api/portal (see README-DEPLOY.md) ============ */
+// Same document interface the page uses on claude.ai, backed by the portal API. Anyone with the link can read
+// (unless a viewer code is set); requests carry the Seamless FM admin code, which unlocks writes.
+// Changes reach every open page within POLL_MS.
 const POLL_MS = 15000;
-function hostedDB(api, getToken) {
+function hostedDB(api, getAccess) {
   let snap = { version: -1, docs: {}, people: {} }, me = null, timer = null;
   const subs = new Set(), meta = { fromCache: false, hasPendingWrites: false };
   const notify = () => subs.forEach(f => { try { f(); } catch (e) { console.error(e); } });
-  async function call(method, body, retry) {
-    const token = await getToken(!!retry);
-    if (!token) throw Object.assign(new Error('no-token'), { code: 'no-token' });
-    const res = await fetch(method === 'GET' ? `${api}?since=${snap.version}` : api, {
-      method, cache: 'no-store',
-      headers: Object.assign({ Authorization: 'Bearer ' + token }, body ? { 'Content-Type': 'application/json' } : {}),
-      body: body ? JSON.stringify(body) : undefined
-    });
-    if (res.status === 401 && !retry) return call(method, body, true);
+  async function call(method, body) {
+    const a = getAccess() || {};
+    const headers = {};
+    if (a.key) headers['X-Portal-Key'] = a.key;
+    if (a.name) headers['X-Portal-Name'] = encodeURIComponent(a.name);
+    if (a.view) headers['X-Portal-View'] = a.view;
+    if (body) headers['Content-Type'] = 'application/json';
+    const res = await fetch(method === 'GET' ? `${api}?since=${snap.version}` : api, { method, cache: 'no-store', headers, body: body ? JSON.stringify(body) : undefined });
     let data = null; try { data = await res.json(); } catch (e) { /* no body */ }
     if (data && data.me) me = data.me;
     if (!res.ok) {
-      const code = res.status === 401 ? 'no-token' : res.status === 403 ? (method === 'GET' ? 'forbidden' : 'invalid_argument') : res.status === 413 ? 'quota_exceeded' : res.status === 400 ? 'invalid_argument' : 'unavailable';
+      const code = res.status === 401 ? 'view-key' : res.status === 403 ? (method === 'GET' ? 'forbidden' : 'read-only') : res.status === 413 ? 'quota_exceeded' : res.status === 400 ? 'invalid_argument' : 'unavailable';
       throw Object.assign(new Error('http-' + res.status), { code, data });
     }
     return data;
@@ -1474,10 +1476,10 @@ function hostedDB(api, getToken) {
   return {
     db: { doc, collection }, user,
     async load() { await refresh(); return me; },
-    refresh,
+    refresh, me: () => me,
     poll(onState) {
       clearInterval(timer);
-      const tick = async () => { if (document.visibilityState !== 'visible') return; try { await refresh(); onState('ok'); } catch (e) { onState(e.code === 'no-token' ? 'auth' : 'err'); } };
+      const tick = async () => { if (document.visibilityState !== 'visible') return; try { await refresh(); onState('ok'); } catch (e) { onState('err'); } };
       timer = setInterval(tick, POLL_MS);
       document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); });
     }
@@ -1487,82 +1489,72 @@ function gate(kind, opts = {}) {
   const g = $('#gate');
   if (kind === 'close') { g.hidden = true; return; }
   const copy = {
-    signin: ['Sign in to continue', `This portal is private to ${esc(DEFAULTS.client)} and Seamless FM. Sign in with the work account Seamless FM invited.`],
-    working: ['Signing you in', 'Connecting to the live portal…'],
-    denied: ['No access yet', `You’re signed in as <b>${esc(opts.email || 'this account')}</b>, which isn’t on the portal’s access list. Ask your Seamless FM contact to add you, or sign in with a different account.`],
-    setup: ['Setup needed', `Sign-in isn’t configured yet. IT: paste the Entra <b>Application (client) ID</b> and <b>Directory (tenant) ID</b> into the <code>PORTAL_HOSTED</code> block at the top of <code>index.html</code>, and register this address as a single-page-app redirect URI: <code>${esc(location.origin + location.pathname)}</code>`],
-    nolib: ['Sign-in didn’t load', 'Microsoft’s sign-in library couldn’t load. Check the internet connection and reload the page.'],
+    working: ['Connecting', 'Loading the live portal…'],
+    view: ['Enter the access code', `This portal is private to ${esc(DEFAULTS.client)} and Seamless FM. Enter the access code you were given.`],
+    code: ['Seamless FM sign-in', 'Enter your name and the Seamless FM admin code to upload trackers, post updates and change settings. Viewing needs no sign-in.'],
     error: ['Couldn’t reach the portal', esc(opts.detail || 'The server didn’t answer. Reload the page to try again.')]
   }[kind] || ['', ''];
   $('#gateTitle').textContent = copy[0];
-  $('#gateMsg').innerHTML = copy[1];
-  $('#gateActions').innerHTML = (opts.actions || []).map(a => `<button type="button" class="btn${a.primary ? ' primary' : ''}" data-gate="${a.id}">${esc(a.label)}</button>`).join('');
+  $('#gateMsg').innerHTML = copy[1] + (opts.bad ? ' <b style="color:var(--bad)">That code isn’t right.</b>' : '');
+  const form = kind === 'code' ? `<div class="gate-form"><label>Your name<input id="gName" maxlength="60" autocomplete="name" value="${esc(opts.name || '')}"></label><label>Admin code<input id="gCode" type="password" autocomplete="off"></label></div>`
+    : kind === 'view' ? `<div class="gate-form"><label>Access code<input id="gCode" type="password" autocomplete="off"></label></div>` : '';
+  $('#gateActions').innerHTML = form + (opts.actions || []).map(a => `<button type="button" class="btn${a.primary ? ' primary' : ''}" data-gate="${a.id}">${esc(a.label)}</button>`).join('');
   g.hidden = false;
+  const first = $('#gName') && !$('#gName').value ? $('#gName') : $('#gCode');
+  if (first) setTimeout(() => first.focus(), 50);
 }
 async function hostedBoot() {
-  const H = window.PORTAL_HOSTED;
-  const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  setLive('off', 'Signed out');
-  if (!guid.test(H.clientId || '') || !(guid.test(H.tenantId || '') || ['organizations', 'common'].includes(H.tenantId))) { gate('setup'); return; }
-  if (typeof msal === 'undefined') { gate('nolib'); return; }
-  const scopes = ['openid', 'profile', 'email'];
-  const app = new msal.PublicClientApplication({
-    auth: { clientId: H.clientId, authority: 'https://login.microsoftonline.com/' + H.tenantId, redirectUri: location.origin + location.pathname },
-    cache: { cacheLocation: 'localStorage' }
-  });
-  if (typeof app.initialize === 'function') await app.initialize();
-  const account = () => app.getActiveAccount() || app.getAllAccounts()[0] || null;
-  const getToken = async force => {
-    const acct = account(); if (!acct) return null;
-    try { return (await app.acquireTokenSilent({ scopes, account: acct, forceRefresh: !!force })).idToken; }
-    catch (e) { return null; }   // expired session: the Reconnect control asks for a fresh sign-in
+  const H = window.PORTAL_HOSTED || {};
+  const ACCESS = 'slp.access';
+  const access = () => store.get(ACCESS, {});
+  const setAccess = patch => store.set(ACCESS, Object.assign({}, access(), patch));
+  const conn = hostedDB(H.api || '/api/portal', access);
+  const codeGate = opts => gate('code', Object.assign({ name: access().name || '', actions: [{ id: 'unlock', label: 'Unlock editing', primary: true }, { id: 'cancel', label: 'Cancel' }] }, opts || {}));
+  let subscribed = false;
+  const applyMe = me => {
+    state.me = me || { id: null }; state.admin = !!(me && me.canEdit); if (!state.admin) state.mode = 'client';
+    const chip = $('#userChip'); chip.hidden = false;
+    chip.textContent = state.admin ? 'Seamless FM · ' + ((me && me.name) || 'admin') : 'Seamless FM sign-in';
+    chip.title = state.admin ? 'Click twice to sign out of editing' : 'Unlock editing with the admin code';
   };
-  const signIn = async () => {
-    const r = await app.loginPopup({ scopes, prompt: 'select_account' });
-    if (r && r.account) app.setActiveAccount(r.account);
-  };
-  let conn = null;
   const connect = async () => {
-    gate('working');
-    conn = conn || hostedDB(H.api || '/api/portal', getToken);
+    setLive('off', 'Connecting');
     try {
       const me = await conn.load();
-      db = conn.db; state.user = conn.user; state.me = me || { id: null };
-      state.admin = !!(me && me.canEdit); if (!state.admin) state.mode = 'client';
-      const chip = $('#userChip'); chip.hidden = false; chip.textContent = (me && (me.name || me.email)) || 'Signed in';
+      db = conn.db; state.user = conn.user; applyMe(me);
       setLive('on', 'Live'); gate('close');
       if (!subscribed) { subscribe(); subscribed = true; }
       render();
-      conn.poll(s => { if (s === 'ok') setLive('on', 'Live'); else if (s === 'auth') setLive('off', 'Reconnect'); else setLive('off', 'Offline'); });
+      conn.poll(s => setLive(s === 'ok' ? 'on' : 'off', s === 'ok' ? 'Live' : 'Offline'));
     } catch (e) {
-      if (e.code === 'forbidden') gate('denied', { email: e.data && e.data.me && e.data.me.email, actions: [{ id: 'switch', label: 'Use a different account', primary: true }] });
-      else if (e.code === 'no-token') gate('signin', { actions: [{ id: 'signin', label: 'Sign in with Microsoft', primary: true }] });
+      if (e.code === 'view-key') gate('view', { bad: !!access().view, actions: [{ id: 'view', label: 'Continue', primary: true }] });
       else gate('error', { detail: e.code === 'unavailable' ? 'The portal server returned an error. Reload the page to try again; if it keeps happening, check the deployment logs.' : undefined, actions: [{ id: 'retry', label: 'Try again', primary: true }] });
     }
   };
-  let subscribed = false;
   $('#gateActions').addEventListener('click', async e => {
     const b = e.target.closest('[data-gate]'); if (!b) return;
-    try {
-      if (b.dataset.gate === 'signin' || b.dataset.gate === 'switch') await signIn();
-      await connect();
-    } catch (err) {
-      if (err && err.errorCode === 'user_cancelled') return;
-      gate('error', { detail: `Sign-in didn’t finish (${(err && (err.errorCode || err.message)) || 'unknown error'}). Allow pop-ups for this site and try again.`, actions: [{ id: 'signin', label: 'Sign in with Microsoft', primary: true }] });
+    const id = b.dataset.gate;
+    if (id === 'cancel') { gate('close'); return; }
+    if (id === 'retry') { await connect(); return; }
+    if (id === 'view') { setAccess({ view: ($('#gCode').value || '').trim() }); await connect(); return; }
+    if (id === 'unlock') {
+      const name = ($('#gName').value || '').trim(), key = ($('#gCode').value || '').trim();
+      if (!name || !key) { toast('Enter your name and the admin code.', true); return; }
+      setAccess({ name, key });
+      try { await conn.refresh(); } catch (err) { /* reported below */ }
+      const me = conn.me();
+      if (me && me.canEdit) { applyMe(me); state.mode = 'admin'; store.set('slp.mode', 'admin'); gate('close'); render(); toast(`Editing unlocked. Welcome, ${name}.`); }
+      else { setAccess({ key: '' }); codeGate({ bad: true, name }); }
     }
   });
-  $('#live').addEventListener('click', async () => {
-    if ($('#liveTxt').textContent !== 'Reconnect') return;
-    try { await signIn(); await conn.refresh(); setLive('on', 'Live'); } catch (err) { toast('Sign-in didn’t finish. Allow pop-ups for this site and try again.', true); }
-  });
-  $('#userChip').addEventListener('click', async e => {
+  $('#gateActions').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); const p = $('#gateActions .btn.primary'); if (p) p.click(); } });
+  $('#userChip').addEventListener('click', e => {
     const b = e.currentTarget;
+    if (!state.admin) { codeGate(); return; }
     if (!b.dataset.armed) { b.dataset.armed = '1'; const t = b.textContent; b.textContent = 'Sign out?'; setTimeout(() => { b.textContent = t; delete b.dataset.armed; }, 3500); return; }
-    try { await app.logoutPopup({ account: account() }); } catch (err) { /* popup closed */ }
-    location.reload();
+    setAccess({ key: '' }); location.reload();
   });
-  if (account()) await connect();
-  else gate('signin', { actions: [{ id: 'signin', label: 'Sign in with Microsoft', primary: true }] });
+  await connect();
 }
 
 async function boot() {

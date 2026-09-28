@@ -1,42 +1,36 @@
 // SUN Holdings Live Portal — data API (Vercel serverless function).
-// Every request must carry a Microsoft Entra ID token for this app. People on PORTAL_VIEWERS can read;
-// people on PORTAL_ADMINS (Seamless FM) can also write. The portal's data is one JSON state kept as
-// numbered versions in a private Vercel Blob store; the newest KEEP_VERSIONS are kept as a rolling backup.
+// Microsoft sign-in is switched off for now. Anyone with the link can read the portal (or, if PORTAL_VIEW_KEY
+// is set, anyone who enters that access code once). Requests that carry the Seamless FM admin code
+// (PORTAL_ADMIN_KEY) can also write: upload trackers, post updates, add notes and change settings.
+// The portal's data is one JSON state kept as numbered versions in a private Vercel Blob store; the newest
+// KEEP_VERSIONS are kept as a rolling backup.
 import { list, put, del } from '@vercel/blob';
-import { createRemoteJWKSet, decodeJwt, jwtVerify } from 'jose';
+import { timingSafeEqual } from 'node:crypto';
 
-const CLIENT_ID = (process.env.ENTRA_CLIENT_ID || '').trim();
-const TENANTS = splitList(process.env.ENTRA_TENANT_IDS);          // tenants whose accounts may sign in
-const ADMINS = splitList(process.env.PORTAL_ADMINS);             // emails or @domains that can edit
-const VIEWERS = splitList(process.env.PORTAL_VIEWERS);           // emails or @domains that can read
+const ADMIN_KEY = (process.env.PORTAL_ADMIN_KEY || '').trim();   // unlocks editing (required for any write)
+const VIEW_KEY = (process.env.PORTAL_VIEW_KEY || '').trim();     // optional: viewers must enter this once
 const PREFIX = 'portal-state-';
 const KEEP_VERSIONS = 30;
 const MAX_DOC_BYTES = 256 * 1024;
 const MAX_DOCS = 5000;
 const SEGMENT = /^[A-Za-z0-9_\-.~:@+]{1,200}$/;
 
-// Entra signs tokens for every tenant with the same key set
-const JWKS = createRemoteJWKSet(new URL('https://login.microsoftonline.com/common/discovery/v2.0/keys'));
-
-function splitList(s) {
-  return String(s || '').split(/[,;\s]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+function same(a, b) {
+  if (!a || !b) return false;
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && timingSafeEqual(x, y);
 }
-const onList = (email, listed) => !!email && listed.some(e => (e.startsWith('@') ? email.endsWith(e) : email === e));
 
-async function identify(req) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
-  if (!token || !CLIENT_ID || !TENANTS.length) return null;
-  let tid = '';
-  try { tid = String(decodeJwt(token).tid || '').toLowerCase(); } catch (e) { return null; }
-  if (!TENANTS.includes(tid)) return null;
-  try {
-    const { payload } = await jwtVerify(token, JWKS, { issuer: `https://login.microsoftonline.com/${tid}/v2.0`, audience: CLIENT_ID });
-    const email = String(payload.email || payload.preferred_username || payload.upn || '').toLowerCase();
-    return { id: email || String(payload.oid || ''), email, name: String(payload.name || email || 'Someone') };
-  } catch (e) {
-    return null;
-  }
+// who is asking: read rights from the link (or the view code), write rights from the admin code
+function identify(req) {
+  const h = k => String(req.headers[k] || '').trim();
+  const canEdit = !!ADMIN_KEY && same(h('x-portal-key'), ADMIN_KEY);
+  const canView = canEdit || !VIEW_KEY || same(h('x-portal-view'), VIEW_KEY);
+  let name = '';
+  try { name = decodeURIComponent(h('x-portal-name')); } catch (e) { name = h('x-portal-name'); }
+  name = name.replace(/[<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) || (canEdit ? 'Seamless FM' : 'Viewer');
+  const id = canEdit ? 'sfm:' + (name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'admin') : 'viewer';
+  return { id, name, canEdit, canView };
 }
 
 async function readBlobJson(blob) {
@@ -85,12 +79,9 @@ function merge(target, patch) {
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
-  const who = await identify(req);
-  if (!who) return res.status(401).json({ error: 'unauthorized' });
-  const canEdit = onList(who.email, ADMINS);
-  const canView = canEdit || onList(who.email, VIEWERS);
-  const me = { id: who.id, name: who.name, email: who.email, canEdit };
-  if (!canView) return res.status(403).json({ error: 'forbidden', me });
+  const who = identify(req);
+  const me = { id: who.id, name: who.name, canEdit: who.canEdit, viewCodeRequired: !!VIEW_KEY, adminCodeSet: !!ADMIN_KEY };
+  if (!who.canView) return res.status(401).json({ error: 'view-key', me });
 
   try {
     if (req.method === 'GET') {
@@ -98,11 +89,11 @@ export default async function handler(req, res) {
       const since = Number(req.query && req.query.since);
       if (Number.isFinite(since) && since === state.version) return res.status(200).json({ unchanged: true, version: state.version, me });
       // names of the Seamless FM people who changed things are for the admin view only
-      return res.status(200).json({ version: state.version, docs: state.docs, people: canEdit ? state.people : {}, me });
+      return res.status(200).json({ version: state.version, docs: state.docs, people: who.canEdit ? state.people : {}, me });
     }
 
     if (req.method === 'POST') {
-      if (!canEdit) return res.status(403).json({ error: 'read-only', me });
+      if (!who.canEdit) return res.status(403).json({ error: 'read-only', me });
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
       const { op, path, data } = body;
       if (!['set', 'update', 'delete'].includes(op)) return res.status(400).json({ error: 'bad-op' });
